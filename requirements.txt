@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+llama-parse
+llama-index
+llama-index-embeddings-gemini
+google-generativeai
+python-dotenv
+requests
+pydantic
+aiofiles
+python-multipart
+mistralai
+httpx
+rank-bm25
+pinecone-client
