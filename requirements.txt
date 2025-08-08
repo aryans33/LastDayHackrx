@@ -8,19 +8,17 @@ llama-parse==0.4.4
 llama-index==0.9.15
 llama-index-embeddings-gemini==0.1.6
 
-# AI/ML Libraries - Use pre-compiled wheels
+# AI/ML Libraries - Pre-compiled wheels for Python 3.11
 numpy==1.24.4
-pandas==2.0.3  # Use stable version with pre-compiled wheels
+pandas==1.5.3
 scipy==1.10.1
-scikit-learn==1.3.2
 
-# Vector database
-pinecone-client==3.0.0
+# Vector database - simplified
+pinecone-client==2.2.4
 faiss-cpu==1.7.4
 
-# Text processing
-rank-bm25==0.2.2
-nltk==3.8.1
+# Text processing - optional fallback
+# rank-bm25==0.2.2  # Will be handled as optional in code
 
 # Google AI
 google-generativeai==0.3.2
@@ -33,6 +31,5 @@ requests==2.31.0
 # Environment management
 python-dotenv==1.0.0
 
-# Utilities
-pathlib2==2.3.7
+# Basic utilities only
 typing-extensions==4.8.0
