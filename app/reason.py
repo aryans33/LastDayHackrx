@@ -4,7 +4,7 @@ import asyncio
 from typing import List, Dict, Any
 import httpx
 from dotenv import load_dotenv
-from models import ClauseReference
+from app.models import ClauseReference
 import logging
 
 logger = logging.getLogger(__name__)
@@ -185,3 +185,4 @@ def create_fallback_response(question: str, chunks: List[Dict[str, Any]], clause
         "confidence": confidence,
         "relevant_clauses": clause_refs
     }
+
