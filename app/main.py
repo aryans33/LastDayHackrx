@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
 from pathlib import Path
 from .models import DocumentRequest, RunResponse, HackRXRequest, HackRXResponse
-import .utils, .parse, .embed, .retrieve, .reason
+from . import utils, parse, embed, retrieve, reason
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -271,5 +271,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
