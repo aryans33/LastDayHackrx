@@ -1,27 +1,9 @@
 services:
   - type: web
-    name: hackrx-document-qa
+    name: lastdayhackrx
     env: python
-    plan: starter
-    runtime: python-3.11.9
-    buildCommand: bash build.sh
-    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install --only-binary=all --no-cache-dir -r requirements.txt && mkdir -p vector_store
+    startCommand: ./start.sh
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: PYTHONUNBUFFERED
-        value: 1
-      - key: GOOGLE_API_KEY
-        fromSecret: GOOGLE_API_KEY
-      - key: LLAMA_CLOUD_API_KEY  
-        fromSecret: LLAMA_CLOUD_API_KEY
-      - key: GROQ_API_KEY
-        fromSecret: GROQ_API_KEY
-      - key: PINECONE_API_KEY
-        fromSecret: PINECONE_API_KEY
-      - key: PINECONE_INDEX
-        value: existing-index
-      - key: PINECONE_NAMESPACE
-        value: rag-hybrid
-      - key: PINECONE_ENVIRONMENT
-        value: us-east-1
