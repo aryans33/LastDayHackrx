@@ -2,7 +2,7 @@ import os
 import pickle
 import logging
 from typing import List, Dict, Any
-import embed
+from app import embed
 
 logger = logging.getLogger(__name__)
 
@@ -61,3 +61,4 @@ def retrieve_chunks(index, question: str, document_path: str, top_k: int = 5) ->
 
     logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks using hybrid search")
     return relevant_chunks
+
