@@ -1,35 +1,9 @@
-# Core web framework
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
-
-# Document processing
 llama-parse==0.4.4
 llama-index==0.9.15
 llama-index-embeddings-gemini==0.1.6
-
-# AI/ML Libraries - Pre-compiled wheels for Python 3.11
 numpy==1.24.4
-pandas==1.5.3
-scipy==1.10.1
-
-# Vector database - simplified
-pinecone-client==2.2.4
-faiss-cpu==1.7.4
-
-# Text processing - optional fallback
-# rank-bm25==0.2.2  # Will be handled as optional in code
-
-# Google AI
-google-generativeai==0.3.2
-
-# HTTP client
-httpx==0.25.2
-aiofiles==23.2.1
-requests==2.31.0
-
-# Environment management
-python-dotenv==1.0.0
-
-# Basic utilities only
-typing-extensions==4.8.0
+setuptools>=70.0.0
+wheel>=0.41.0
