@@ -10,10 +10,22 @@ import google.generativeai as genai
 from llama_index.embeddings.gemini import GeminiEmbedding
 from dotenv import load_dotenv
 import logging
-from rank_bm25 import BM25Okapi
 import re
 
-from pinecone import Pinecone
+# Try to import optional dependencies
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+    logging.warning("rank_bm25 not available, BM25 search will be disabled")
+
+try:
+    from pinecone import Pinecone
+    PINECONE_AVAILABLE = True
+except ImportError:
+    PINECONE_AVAILABLE = False
+    logging.warning("pinecone-client not available, using local storage only")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,8 +53,8 @@ CHUNK_BATCH_SIZE = 50
 
 # Pinecone configuration - Updated to use namespaces
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX", "existing-index")  # Use existing index
-PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "rag-hybrid")  # Use namespace for data separation
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX", "existing-index")
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "rag-hybrid")
 PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
 EMBED_DIM = 768
 
@@ -51,32 +63,40 @@ pinecone_index = None
 
 def _init_pinecone():
     global pc, pinecone_index
+    if not PINECONE_AVAILABLE:
+        logger.warning("Pinecone not available, using local storage only")
+        return
+        
     if not PINECONE_API_KEY:
-        raise RuntimeError("PINECONE_API_KEY not set in environment")
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    
+        logger.warning("PINECONE_API_KEY not set, using local storage only")
+        return
+        
     try:
-        # Connect to existing index instead of creating new one
+        pc = Pinecone(api_key=PINECONE_API_KEY)
         pinecone_index = pc.Index(PINECONE_INDEX_NAME)
         logger.info(f"Connected to existing Pinecone index '{PINECONE_INDEX_NAME}' with namespace '{PINECONE_NAMESPACE}'")
     except Exception as e:
-        logger.error(f"Failed to connect to index '{PINECONE_INDEX_NAME}': {e}")
-        raise
+        logger.error(f"Failed to connect to Pinecone: {e}")
+        logger.warning("Continuing with local storage only")
 
 class HybridRAGIndex:
-    """Hybrid RAG Index combining dense (Pinecone) and sparse (BM25) retrieval with multi-level chunking"""
+    """Hybrid RAG Index combining dense and sparse retrieval with multi-level chunking"""
     
     def __init__(self):
         if not os.path.isdir(VECTOR_STORE_DIR):
             os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
-        if pinecone_index is None:
+        
+        # Initialize Pinecone if available
+        if PINECONE_AVAILABLE and pinecone_index is None:
             _init_pinecone()
         self.pinecone = pinecone_index
+        
         self.sparse_index = None  # BM25
         self.metadata: Dict[str, Dict[str, Any]] = {}
         self.document_chunks: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         self.bm25_corpus: List[List[str]] = []
         self.chunk_to_parent: Dict[str, str] = {}
+        self.local_vectors: Dict[str, List[float]] = {}  # Fallback storage
 
     def create_or_load_index(self):
         """Create or load local metadata/BM25 (vectors live in Pinecone)"""
@@ -92,13 +112,15 @@ class HybridRAGIndex:
                 self.document_chunks = data.get('document_chunks', {})
                 self.bm25_corpus = data.get('bm25_corpus', [])
                 self.chunk_to_parent = data.get('chunk_to_parent', {})
+                self.local_vectors = data.get('local_vectors', {})
             else:
                 self.metadata = data
                 self.document_chunks = {}
                 self.bm25_corpus = []
                 self.chunk_to_parent = {}
+                self.local_vectors = {}
             
-            if os.path.exists(bm25_path) and self.bm25_corpus:
+            if BM25_AVAILABLE and os.path.exists(bm25_path) and self.bm25_corpus:
                 try:
                     with open(bm25_path, 'rb') as f:
                         self.sparse_index = pickle.load(f)
@@ -110,9 +132,15 @@ class HybridRAGIndex:
             self.document_chunks = {}
             self.bm25_corpus = []
             self.chunk_to_parent = {}
+            self.local_vectors = {}
             logger.info("Initialized empty local state")
         
-        logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' namespace '{PINECONE_NAMESPACE}' ready; init took {time.time() - start_time:.2f}s")
+        if self.pinecone:
+            logger.info(f"Pinecone index '{PINECONE_INDEX_NAME}' namespace '{PINECONE_NAMESPACE}' ready")
+        else:
+            logger.info("Using local storage only")
+            
+        logger.info(f"Init took {time.time() - start_time:.2f}s")
         return self
 
 def process_chunk_parallel(chunk_data: Tuple[Dict[str, Any], int]) -> Tuple[List[Dict], List[Dict]]:
@@ -172,76 +200,53 @@ def create_multi_level_chunks_parallel(chunks: List[Dict[str, Any]]) -> Tuple[Li
     return all_short_chunks, all_long_chunks
 
 def is_valid_embedding(embedding: List[float], min_norm: float = 1e-6) -> bool:
-    """
-    Check if embedding is valid (not None, not empty, not all zeros, has reasonable norm).
-    
-    Args:
-        embedding: The embedding vector to validate
-        min_norm: Minimum acceptable L2 norm for the embedding
-    
-    Returns:
-        bool: True if embedding is valid, False otherwise
-    """
+    """Check if embedding is valid"""
     if not embedding or not isinstance(embedding, (list, tuple)):
         return False
     
     try:
         arr = np.array(embedding, dtype=float)
-        
-        # Check if array is empty
         if arr.size == 0:
             return False
-            
-        # Check if all values are finite (not NaN or inf)
         if not np.all(np.isfinite(arr)):
             return False
-            
-        # Check if norm is above minimum threshold
         norm = np.linalg.norm(arr)
         if norm < min_norm:
             return False
-            
         return True
     except Exception as e:
         logger.error(f"Error validating embedding: {e}")
         return False
 
 def process_embedding_batch(batch_texts: List[str], doc_id: Optional[str] = None) -> List[Optional[List[float]]]:
-    """
-    Synchronous embedding batch processing. Returns a list containing either:
-    - normalized embedding (List[float]) for each non-empty text, or
-    - None for skipped/errored items.
-    """
+    """Synchronous embedding batch processing"""
     embeddings: List[Optional[List[float]]] = []
     for i, text in enumerate(batch_texts):
-        # Skip empty or whitespace-only text
         if not (text and text.strip()):
-            logger.warning(f"[Doc {doc_id}] Batch item {i}: Skipping empty chunk text for embedding")
+            logger.warning(f"[Doc {doc_id}] Batch item {i}: Skipping empty chunk text")
             embeddings.append(None)
             continue
             
-        # Skip very short text that might not generate meaningful embeddings
         if len(text.strip()) < 3:
-            logger.warning(f"[Doc {doc_id}] Batch item {i}: Skipping very short text: '{text[:50]}'")
+            logger.warning(f"[Doc {doc_id}] Batch item {i}: Skipping very short text")
             embeddings.append(None)
             continue
             
         try:
             result = genai.embed_content(
                 model="models/embedding-001",
-                content=text.strip(),  # Ensure we strip whitespace
+                content=text.strip(),
                 task_type="retrieval_document"
             )
             emb = result.get('embedding')
             
             if not emb or not isinstance(emb, (list, tuple)):
-                logger.warning(f"[Doc {doc_id}] Batch item {i}: Received invalid embedding (None or wrong type)")
+                logger.warning(f"[Doc {doc_id}] Batch item {i}: Received invalid embedding")
                 embeddings.append(None)
                 continue
                 
-            # Validate embedding before normalization
             if not is_valid_embedding(emb):
-                logger.warning(f"[Doc {doc_id}] Batch item {i}: Embedding failed validation (likely all zeros or invalid)")
+                logger.warning(f"[Doc {doc_id}] Batch item {i}: Embedding failed validation")
                 embeddings.append(None)
                 continue
                 
@@ -249,41 +254,31 @@ def process_embedding_batch(batch_texts: List[str], doc_id: Optional[str] = None
             emb_arr = np.array(emb, dtype=float)
             norm = np.linalg.norm(emb_arr)
             
-            if norm > 1e-6:  # Use a reasonable threshold
+            if norm > 1e-6:
                 emb_norm = (emb_arr / norm).tolist()
-                
-                # Final validation after normalization
                 if is_valid_embedding(emb_norm):
                     embeddings.append(emb_norm)
                 else:
                     logger.warning(f"[Doc {doc_id}] Batch item {i}: Normalized embedding failed validation")
                     embeddings.append(None)
             else:
-                logger.warning(f"[Doc {doc_id}] Batch item {i}: Embedding norm too small ({norm}), likely all zeros")
+                logger.warning(f"[Doc {doc_id}] Batch item {i}: Embedding norm too small")
                 embeddings.append(None)
                 
         except Exception as e:
             logger.error(f"[Doc {doc_id}] Batch item {i}: Error generating embedding: {e}")
-            # Log the problematic text (truncated)
-            logger.error(f"[Doc {doc_id}] Problematic text: '{text[:100]}...'")
             embeddings.append(None)
             
     return embeddings
 
 def generate_embeddings_parallel(texts: List[str]) -> List[Optional[List[float]]]:
-    """
-    Generate embeddings in parallel batches using ThreadPoolExecutor.
-    Returns a list aligned with `texts` where each item is either:
-      - a normalized embedding list (List[float]) or
-      - None (if skipped/failed)
-    """
+    """Generate embeddings in parallel batches"""
     if not texts:
         return []
     
     batches = [texts[i:i + EMBEDDING_BATCH_SIZE] for i in range(0, len(texts), EMBEDDING_BATCH_SIZE)]
     all_embeddings: List[Optional[List[float]]] = [None] * len(texts)
     
-    # Use a threadpool to call the synchronous process_embedding_batch
     with ThreadPoolExecutor(max_workers=min(4, len(batches) or 1)) as executor:
         future_to_idx = {}
         for idx, batch in enumerate(batches):
@@ -297,7 +292,7 @@ def generate_embeddings_parallel(texts: List[str]) -> List[Optional[List[float]]
             except Exception as exc:
                 logger.error(f"Embedding batch {batch_idx} error: {exc}")
                 batch_embeddings = [None] * len(batches[batch_idx])
-            # Put batch_embeddings into the right slice of all_embeddings
+            
             start = batch_idx * EMBEDDING_BATCH_SIZE
             for offset, emb in enumerate(batch_embeddings):
                 if start + offset < len(all_embeddings):
@@ -339,7 +334,7 @@ async def add_chunks_to_hybrid_index(
     chunks: List[Dict[str, Any]],
     document_path: str = None
 ):
-    """Add chunks to hybrid index with parallel multi-level chunking and upsert to Pinecone."""
+    """Add chunks to hybrid index with parallel processing"""
     total_start_time = time.time()
     logger.info(f"Starting hybrid index update for {len(chunks)} chunks")
     
@@ -349,12 +344,12 @@ async def add_chunks_to_hybrid_index(
 
     document_id = chunks[0].get('document_id')
 
-    # Remove existing vectors for this document from Pinecone and local caches
+    # Remove existing document
     remove_start = time.time()
     try:
         remove_document_from_hybrid_index(hybrid_index, document_id)
     except Exception as e:
-        logger.error(f"Error removing existing document vectors: {e}")
+        logger.error(f"Error removing existing document: {e}")
     logger.info(f"Document removal completed in {time.time() - remove_start:.2f}s")
 
     # Multi-level chunking
@@ -363,7 +358,7 @@ async def add_chunks_to_hybrid_index(
     all_chunks = short_chunks + long_chunks
     logger.info(f"Multi-level chunking completed in {time.time() - chunking_start:.2f}s")
 
-    # Store document chunk structures locally (we do this early so we can reference them)
+    # Store document chunk structures
     storage_start = time.time()
     hybrid_index.document_chunks[document_id] = {
         'original': chunks,
@@ -372,38 +367,29 @@ async def add_chunks_to_hybrid_index(
     }
     logger.info(f"Document chunks storage completed in {time.time() - storage_start:.2f}s")
 
-    # Generate embeddings in parallel
+    # Generate embeddings
     embedding_start = time.time()
     chunk_texts = [chunk.get('text', '') or '' for chunk in all_chunks]
-    # generate_embeddings_parallel is synchronous (returns list), call it via asyncio.to_thread to avoid blocking the event loop
     loop = asyncio.get_event_loop()
     embeddings: List[Optional[List[float]]] = await loop.run_in_executor(None, generate_embeddings_parallel, chunk_texts)
     
-    # Log embedding statistics
     valid_embeddings = sum(1 for emb in embeddings if emb is not None)
     logger.info(f"Embedding generation completed in {time.time() - embedding_start:.2f}s")
     logger.info(f"Generated {valid_embeddings}/{len(embeddings)} valid embeddings")
 
-    # Prepare vectors for Pinecone - filter out None (skipped/failed) embeddings
+    # Prepare vectors for storage
     upsert_start = time.time()
     vectors = []
-    successful_chunk_ids: List[str] = []  # track chunks that will be upserted successfully (by id)
+    successful_chunk_ids: List[str] = []
     skipped_count = 0
     
     for emb, chunk in zip(embeddings, all_chunks):
         if emb is None:
-            # Skip: either empty text or embedding generation failed or embedding was all zeros
             skipped_count += 1
-            chunk_id = chunk.get('chunk_id', 'unknown')
-            chunk_text_preview = (chunk.get('text', '') or '')[:100]
-            logger.warning(f"Skipping chunk {chunk_id} due to missing/invalid embedding. Text: '{chunk_text_preview}...'")
             continue
             
-        # Double-check the embedding is valid before adding to Pinecone
         if not is_valid_embedding(emb):
             skipped_count += 1
-            chunk_id = chunk.get('chunk_id', 'unknown')
-            logger.warning(f"Skipping chunk {chunk_id} - final embedding validation failed")
             continue
 
         vid = str(chunk.get('chunk_id'))
@@ -420,72 +406,64 @@ async def add_chunks_to_hybrid_index(
             "section_index": chunk.get("section_index"),
             "short_text": (chunk.get("text") or "")[:300],
         }
+        
+        # Store in local vectors as fallback
+        hybrid_index.local_vectors[vid] = emb
+        
         vectors.append({"id": vid, "values": emb, "metadata": meta})
         successful_chunk_ids.append(vid)
 
-    logger.info(f"Prepared {len(vectors)} vectors for Pinecone upsert (skipped {skipped_count})")
+    logger.info(f"Prepared {len(vectors)} vectors for storage (skipped {skipped_count})")
 
-    # Upsert to Pinecone in batches with namespace
-    if hybrid_index.pinecone and vectors:  # Only upsert if we have valid vectors
+    # Try to upsert to Pinecone if available
+    if hybrid_index.pinecone and vectors:
         try:
             batch = 100
             for i in range(0, len(vectors), batch):
                 batch_vectors = vectors[i:i+batch]
-                # Final validation of batch before upsert
-                valid_batch = []
-                for vec in batch_vectors:
-                    if is_valid_embedding(vec["values"]):
-                        valid_batch.append(vec)
-                    else:
-                        logger.error(f"Invalid vector detected in batch: {vec['id']}")
+                valid_batch = [vec for vec in batch_vectors if is_valid_embedding(vec["values"])]
                 
                 if valid_batch:
                     hybrid_index.pinecone.upsert(
                         vectors=valid_batch,
                         namespace=PINECONE_NAMESPACE
                     )
-                    logger.info(f"Upserted batch {i//batch + 1}: {len(valid_batch)} vectors")
+                    logger.info(f"Upserted batch {i//batch + 1}: {len(valid_batch)} vectors to Pinecone")
         except Exception as e:
             logger.error(f"Pinecone upsert error: {e}")
-            # On failure, we should avoid marking local metadata for unsuccessful chunks.
-            # We'll continue and only update local caches for chunks that were part of the upsert request.
-    else:
-        if not hybrid_index.pinecone:
-            logger.error("Pinecone index is not initialized. Skipping upsert.")
-        if not vectors:
-            logger.warning("No valid vectors to upsert to Pinecone.")
+            logger.info("Continuing with local storage")
 
-    logger.info(f"Pinecone upsert completed in {time.time() - upsert_start:.2f}s")
+    logger.info(f"Vector storage completed in {time.time() - upsert_start:.2f}s")
 
-    # Cache successful chunk metadata locally for reconstructing text later
+    # Update metadata
     metadata_start = time.time()
-    # Only store metadata for chunks that had valid embeddings and were attempted to be upserted
     for chunk in all_chunks:
         cid = chunk.get('chunk_id')
         if cid and str(cid) in successful_chunk_ids:
             hybrid_index.metadata[cid] = chunk
     logger.info(f"Metadata update completed in {time.time() - metadata_start:.2f}s")
 
-    # BM25 corpus and index - only include tokenized texts for successfully upserted chunks
-    bm25_start = time.time()
-    texts_for_bm25 = []
-    for chunk in all_chunks:
-        cid = chunk.get('chunk_id')
-        if cid and str(cid) in successful_chunk_ids:
-            text = chunk.get('text', '') or ''
-            if text.strip():  # Only include non-empty texts
-                texts_for_bm25.append(text)
-    
-    if texts_for_bm25:
-        tokenized_chunks = tokenize_texts_parallel(texts_for_bm25)
-        hybrid_index.bm25_corpus.extend(tokenized_chunks)
-        try:
-            hybrid_index.sparse_index = BM25Okapi(hybrid_index.bm25_corpus) if hybrid_index.bm25_corpus else None
-        except Exception as e:
-            logger.error(f"BM25 index build error: {e}")
-            hybrid_index.sparse_index = None
-    
-    logger.info(f"BM25 processing completed in {time.time() - bm25_start:.2f}s")
+    # BM25 processing (if available)
+    if BM25_AVAILABLE:
+        bm25_start = time.time()
+        texts_for_bm25 = []
+        for chunk in all_chunks:
+            cid = chunk.get('chunk_id')
+            if cid and str(cid) in successful_chunk_ids:
+                text = chunk.get('text', '') or ''
+                if text.strip():
+                    texts_for_bm25.append(text)
+        
+        if texts_for_bm25:
+            tokenized_chunks = tokenize_texts_parallel(texts_for_bm25)
+            hybrid_index.bm25_corpus.extend(tokenized_chunks)
+            try:
+                hybrid_index.sparse_index = BM25Okapi(hybrid_index.bm25_corpus) if hybrid_index.bm25_corpus else None
+            except Exception as e:
+                logger.error(f"BM25 index build error: {e}")
+                hybrid_index.sparse_index = None
+        
+        logger.info(f"BM25 processing completed in {time.time() - bm25_start:.2f}s")
 
     # Parent-child mapping
     mapping_start = time.time()
@@ -501,19 +479,12 @@ async def add_chunks_to_hybrid_index(
     try:
         save_hybrid_index(hybrid_index)
     except Exception as e:
-        logger.error(f"Error saving hybrid index to disk: {e}")
+        logger.error(f"Error saving hybrid index: {e}")
     logger.info(f"Index saving completed in {time.time() - save_start:.2f}s")
 
     total_time = time.time() - total_start_time
-    logger.info(f"""
-=== HYBRID INDEX UPDATE SUMMARY ===
-Total base chunks: {len(chunks)} → {len(all_chunks)} generated chunks ({len(short_chunks)} short + {len(long_chunks)} long)
-Successfully upserted chunks: {len(successful_chunk_ids)}
-Skipped chunks: {skipped_count}
-Document ID: {document_id}
-TOTAL TIME: {total_time:.2f}s
-=====================================
-""")
+    logger.info(f"HYBRID INDEX UPDATE COMPLETED: {total_time:.2f}s, {len(successful_chunk_ids)} chunks indexed")
+    
     return hybrid_index
 
 def split_into_short_chunks(text: str, max_chars: int = 300) -> List[str]:
@@ -542,7 +513,6 @@ def split_into_short_chunks(text: str, max_chars: int = 300) -> List[str]:
     if current_chunk:
         chunks.append(current_chunk.strip())
     
-    # Filter out empty chunks
     return [chunk for chunk in chunks if chunk.strip()]
 
 def split_into_long_chunks(text: str, max_chars: int = 1000) -> List[str]:
@@ -567,7 +537,6 @@ def split_into_long_chunks(text: str, max_chars: int = 1000) -> List[str]:
     if current_chunk:
         chunks.append(current_chunk.strip())
     
-    # Filter out empty chunks
     return [chunk for chunk in chunks if chunk.strip()]
 
 def tokenize_text(text: str) -> List[str]:
@@ -588,9 +557,12 @@ def hybrid_search(hybrid_index: HybridRAGIndex, query: str, document_id: str, to
     dense_results = dense_search(hybrid_index, query, document_id, top_k * 2)
     dense_time = time.time() - dense_start
 
-    # Sparse retrieval (keyword matching)
+    # Sparse retrieval (keyword matching) - only if BM25 is available
     sparse_start = time.time()
-    sparse_results = sparse_search(hybrid_index, query, document_id, top_k * 2)
+    if BM25_AVAILABLE:
+        sparse_results = sparse_search(hybrid_index, query, document_id, top_k * 2)
+    else:
+        sparse_results = []
     sparse_time = time.time() - sparse_start
 
     # Combine and rerank results
@@ -604,24 +576,17 @@ def hybrid_search(hybrid_index: HybridRAGIndex, query: str, document_id: str, to
     expand_time = time.time() - expand_start
 
     total_search_time = time.time() - search_start
-    logger.info(f"""
-=== HYBRID SEARCH SUMMARY ===
-Query: '{query[:50]}...'
-Results: {len(expanded_results)} chunks
-Total: {total_search_time:.3f}s
-============================
-""")
+    logger.info(f"Hybrid search completed in {total_search_time:.3f}s - {len(expanded_results)} results")
     return expanded_results
 
 def dense_search(hybrid_index: HybridRAGIndex, query: str, document_id: str, top_k: int) -> List[Dict]:
-    """Dense semantic search using Pinecone with namespace"""
-    # generate synchronous embedding for the query
+    """Dense semantic search using Pinecone or local vectors"""
+    # Generate query embedding
     query_embeddings = generate_embeddings([query])
     if not query_embeddings or not is_valid_embedding(query_embeddings[0]):
-        logger.warning("Query embedding generation failed or invalid")
+        logger.warning("Query embedding generation failed")
         return []
         
-    # query_embeddings is a list of embedding lists — take first
     q_vec = np.array(query_embeddings[0], dtype=float)
     norm = np.linalg.norm(q_vec)
     if norm > 1e-6:
@@ -630,54 +595,92 @@ def dense_search(hybrid_index: HybridRAGIndex, query: str, document_id: str, top
         logger.warning("Query embedding has zero norm")
         return []
 
-    res = hybrid_index.pinecone.query(
-        vector=q_vec,
-        top_k=top_k * 3,
-        include_metadata=True,
-        namespace=PINECONE_NAMESPACE,
-        filter={"document_id": {"$eq": document_id}}
-    )
-
     results: List[Dict] = []
-    for match in res.get("matches", []):
-        meta = match.get("metadata", {}) or {}
-        cid = meta.get("chunk_id")
-        # Rehydrate full text from local cache
-        chunk_local = hybrid_index.metadata.get(cid, {}) if cid else {}
-        chunk_data = {
-            "text": chunk_local.get("text", meta.get("short_text", "")),
-            "chunk_id": cid,
-            "document_id": meta.get("document_id"),
-            "file_path": meta.get("file_path"),
-            "title": meta.get("title"),
-            "page_number": meta.get("page_number"),
-            "type": meta.get("type"),
-            "chunk_type": meta.get("chunk_type", "original"),
-            "parent_id": meta.get("parent_id"),
-        }
-        results.append({
-            "score": float(match.get("score", 0.0)),
-            "chunk_data": chunk_data,
-            "retrieval_type": "dense"
-        })
-        if len(results) >= top_k:
-            break
+    
+    # Try Pinecone first
+    if hybrid_index.pinecone:
+        try:
+            res = hybrid_index.pinecone.query(
+                vector=q_vec,
+                top_k=top_k * 3,
+                include_metadata=True,
+                namespace=PINECONE_NAMESPACE,
+                filter={"document_id": {"$eq": document_id}}
+            )
+
+            for match in res.get("matches", []):
+                meta = match.get("metadata", {}) or {}
+                cid = meta.get("chunk_id")
+                chunk_local = hybrid_index.metadata.get(cid, {}) if cid else {}
+                chunk_data = {
+                    "text": chunk_local.get("text", meta.get("short_text", "")),
+                    "chunk_id": cid,
+                    "document_id": meta.get("document_id"),
+                    "file_path": meta.get("file_path"),
+                    "title": meta.get("title"),
+                    "page_number": meta.get("page_number"),
+                    "type": meta.get("type"),
+                    "chunk_type": meta.get("chunk_type", "original"),
+                    "parent_id": meta.get("parent_id"),
+                }
+                results.append({
+                    "score": float(match.get("score", 0.0)),
+                    "chunk_data": chunk_data,
+                    "retrieval_type": "dense"
+                })
+                if len(results) >= top_k:
+                    break
+        except Exception as e:
+            logger.error(f"Pinecone query error: {e}")
+    
+    # Fallback to local vectors if Pinecone failed or not available
+    if not results and hybrid_index.local_vectors:
+        logger.info("Using local vector search as fallback")
+        similarities = []
+        chunk_ids = []
+        
+        for cid, vec in hybrid_index.local_vectors.items():
+            chunk_data = hybrid_index.metadata.get(cid)
+            if chunk_data and chunk_data.get('document_id') == document_id:
+                if is_valid_embedding(vec):
+                    vec_norm = np.array(vec, dtype=float)
+                    similarity = np.dot(q_vec, vec_norm)
+                    similarities.append(similarity)
+                    chunk_ids.append(cid)
+        
+        if similarities:
+            top_indices = np.argsort(similarities)[::-1][:top_k]
+            for idx in top_indices:
+                cid = chunk_ids[idx]
+                chunk_data = hybrid_index.metadata[cid]
+                results.append({
+                    "score": float(similarities[idx]),
+                    "chunk_data": chunk_data,
+                    "retrieval_type": "dense_local"
+                })
+    
     return results
 
 def sparse_search(hybrid_index: HybridRAGIndex, query: str, document_id: str, top_k: int) -> List[Dict]:
     """Sparse keyword search using BM25"""
-    if not hybrid_index.sparse_index:
+    if not BM25_AVAILABLE or not hybrid_index.sparse_index:
         return []
     
     query_tokens = tokenize_text(query)
     if not query_tokens:
         return []
-    bm25_scores = hybrid_index.sparse_index.get_scores(query_tokens)
+        
+    try:
+        bm25_scores = hybrid_index.sparse_index.get_scores(query_tokens)
+    except Exception as e:
+        logger.error(f"BM25 scoring error: {e}")
+        return []
     
     # Map bm25 index positions back to chunk ids
     chunk_ids_in_order = list(hybrid_index.metadata.keys())
     if len(bm25_scores) == 0:
         return []
+        
     top_indices = np.argsort(bm25_scores)[::-1][:top_k * 3]
     
     results: List[Dict] = []
@@ -768,22 +771,25 @@ def expand_with_context(hybrid_index: HybridRAGIndex, results: List[Dict]) -> Li
     return expanded_results
 
 def remove_document_from_hybrid_index(hybrid_index: HybridRAGIndex, document_id: str):
-    """Remove a document's vectors from Pinecone and clean local caches."""
-    # Delete from Pinecone with namespace
-    try:
-        hybrid_index.pinecone.delete(
-            filter={"document_id": {"$eq": document_id}},
-            namespace=PINECONE_NAMESPACE  # Add namespace parameter
-        )
-        logger.info(f"Deleted Pinecone vectors for document {document_id} in namespace {PINECONE_NAMESPACE}")
-    except Exception as e:
-        logger.error(f"Pinecone delete error: {e}")
+    """Remove a document's vectors from storage and clean local caches"""
+    # Delete from Pinecone if available
+    if hybrid_index.pinecone:
+        try:
+            hybrid_index.pinecone.delete(
+                filter={"document_id": {"$eq": document_id}},
+                namespace=PINECONE_NAMESPACE
+            )
+            logger.info(f"Deleted Pinecone vectors for document {document_id}")
+        except Exception as e:
+            logger.error(f"Pinecone delete error: {e}")
 
     # Clean local caches
     to_del = [cid for cid, cdata in hybrid_index.metadata.items() if cdata.get('document_id') == document_id]
     for cid in to_del:
         try:
             del hybrid_index.metadata[cid]
+            if cid in hybrid_index.local_vectors:
+                del hybrid_index.local_vectors[cid]
         except KeyError:
             pass
 
@@ -793,38 +799,40 @@ def remove_document_from_hybrid_index(hybrid_index: HybridRAGIndex, document_id:
         except KeyError:
             pass
 
-    # Rebuild BM25 from remaining metadata
-    try:
-        texts = [c['text'] for _, c in hybrid_index.metadata.items() if c.get('text') and c['text'].strip()]
-        tokenized = tokenize_texts_parallel(texts) if texts else []
-        hybrid_index.bm25_corpus = tokenized
-        hybrid_index.sparse_index = BM25Okapi(hybrid_index.bm25_corpus) if tokenized else None
-    except Exception as e:
-        logger.error(f"BM25 rebuild error after deletion: {e}")
+    # Rebuild BM25 from remaining metadata if available
+    if BM25_AVAILABLE:
+        try:
+            texts = [c['text'] for _, c in hybrid_index.metadata.items() if c.get('text') and c['text'].strip()]
+            tokenized = tokenize_texts_parallel(texts) if texts else []
+            hybrid_index.bm25_corpus = tokenized
+            hybrid_index.sparse_index = BM25Okapi(hybrid_index.bm25_corpus) if tokenized else None
+        except Exception as e:
+            logger.error(f"BM25 rebuild error: {e}")
 
 def save_hybrid_index(hybrid_index: HybridRAGIndex):
-    """Save local metadata and BM25 to disk."""
+    """Save local metadata and BM25 to disk"""
     metadata_path = os.path.join(VECTOR_STORE_DIR, METADATA_FILE)
     with open(metadata_path, 'wb') as f:
         pickle.dump({
             'metadata': hybrid_index.metadata,
             'document_chunks': hybrid_index.document_chunks,
             'bm25_corpus': hybrid_index.bm25_corpus,
-            'chunk_to_parent': hybrid_index.chunk_to_parent
+            'chunk_to_parent': hybrid_index.chunk_to_parent,
+            'local_vectors': hybrid_index.local_vectors
         }, f)
 
-    if hybrid_index.sparse_index:
+    if BM25_AVAILABLE and hybrid_index.sparse_index:
         bm25_path = os.path.join(VECTOR_STORE_DIR, BM25_FILE)
         with open(bm25_path, 'wb') as f:
             pickle.dump(hybrid_index.sparse_index, f)
 
 def generate_embeddings(texts: List[str]) -> List[List[float]]:
-    """Synchronous embedding (used in dense_search query embedding)"""
+    """Synchronous embedding generation"""
     embeddings: List[List[float]] = []
     for text in texts:
         if not text or not text.strip():
             logger.warning("Skipping empty text for embedding generation")
-            embeddings.append([0.0] * EMBED_DIM)  # Return zero vector for alignment
+            embeddings.append([0.0] * EMBED_DIM)
             continue
             
         try:
@@ -847,14 +855,12 @@ def generate_embeddings(texts: List[str]) -> List[List[float]]:
             if norm > 1e-6:
                 emb_norm = (emb_arr / norm).tolist()
             else:
-                # If query embedding is all zeros, keep it as-is (rare) but return as floats
                 logger.warning(f"Query embedding has zero norm: '{text[:50]}'")
                 emb_norm = [0.0] * EMBED_DIM
                 
             embeddings.append(emb_norm)
         except Exception as e:
-            logger.error(f"Error generating synchronous embedding for text: {e}")
-            # Fallback: append a zero-vector for alignment
+            logger.error(f"Error generating synchronous embedding: {e}")
             embeddings.append([0.0] * EMBED_DIM)
     return embeddings
 
