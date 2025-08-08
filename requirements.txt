@@ -1,3 +1,4 @@
+aiofiles
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
@@ -7,3 +8,4 @@ llama-index-embeddings-gemini==0.1.6
 numpy==1.24.4
 setuptools>=70.0.0
 wheel>=0.41.0
+
