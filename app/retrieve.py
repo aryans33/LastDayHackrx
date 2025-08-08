@@ -2,7 +2,7 @@ import os
 import pickle
 import logging
 from typing import List, Dict, Any
-import embed
+from app import embed  # CHANGED: absolute import
 
 logger = logging.getLogger(__name__)
 
